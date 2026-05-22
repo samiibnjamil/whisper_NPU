@@ -1,0 +1,15 @@
+.next/
+.playwright-mcp/
+.venv/
+node_modules/
+__pycache__/
+
+models/
+uploads/
+
+*.pyc
+*.wav
+*.mp3
+*.m4a
+*.zip
+*.exe
