@@ -291,7 +291,7 @@ export default function Home() {
           </select>
           <label style={styles.toggleRow}>
             <input type="checkbox" checked={splitSpeakers} onChange={(e) => setSplitSpeakers(e.target.checked)} disabled />
-            <span>Split transcript by speaker</span>
+            <span>Split transcript by speaker (not working yet)</span>
             <span style={styles.toggleHint}>Requires speaker diarization</span>
           </label>
           <div style={styles.actions}>
