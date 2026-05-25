@@ -24,6 +24,38 @@ function toNumber(value) {
   return Number.isFinite(n) ? Math.round(n * 10) / 10 : null;
 }
 
+async function readNpuTelemetry() {
+  const npuCounterOut = await runPowershell(
+    "$s = Get-Counter '\\NPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; " +
+      "if ($s) { ($s.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum }"
+  );
+  const npuPercent = toNumber(npuCounterOut);
+  if (npuPercent !== null) {
+    return {
+      npuPercent,
+      npuTelemetryAvailable: true,
+      npuTelemetrySource: "perf-counter",
+      npuTelemetryReason: null,
+    };
+  }
+
+  const npuDeviceOut = await runPowershell(
+    "$device = Get-PnpDevice -Class ComputeAccelerator -ErrorAction SilentlyContinue | " +
+      "Where-Object { $_.FriendlyName -match 'NPU|AI Boost|Intel\\(R\\) AI' } | " +
+      "Select-Object -First 1 -ExpandProperty FriendlyName; " +
+      "if ($device) { $device }"
+  );
+
+  return {
+    npuPercent: null,
+    npuTelemetryAvailable: false,
+    npuTelemetrySource: null,
+    npuTelemetryReason: npuDeviceOut
+      ? `${npuDeviceOut} is present, but Windows is not exposing an NPU performance counter to PowerShell.`
+      : "No NPU performance counter was found.",
+  };
+}
+
 async function readUsage() {
   const cpuOut = await runPowershell(
     "(Get-Counter '\\Processor(_Total)\\% Processor Time' -SampleInterval 1 -MaxSamples 1).CounterSamples.CookedValue"
@@ -38,16 +70,16 @@ async function readUsage() {
     "$s = Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; " +
       "if ($s) { ($s.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum }"
   );
-  const npuOut = await runPowershell(
-    "$s = Get-Counter '\\NPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue; " +
-      "if ($s) { ($s.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum }"
-  );
+  const npuTelemetry = await readNpuTelemetry();
 
   return {
     cpuPercent: toNumber(cpuOut),
     ramPercent: toNumber(ramOut),
     gpuPercent: toNumber(gpuOut),
-    npuPercent: toNumber(npuOut),
+    npuPercent: npuTelemetry.npuPercent,
+    npuTelemetryAvailable: npuTelemetry.npuTelemetryAvailable,
+    npuTelemetrySource: npuTelemetry.npuTelemetrySource,
+    npuTelemetryReason: npuTelemetry.npuTelemetryReason,
   };
 }
 
@@ -66,6 +98,9 @@ export default async function handler(req, res) {
       ramPercent: null,
       gpuPercent: null,
       npuPercent: null,
+      npuTelemetryAvailable: false,
+      npuTelemetrySource: null,
+      npuTelemetryReason: "System usage probe failed.",
     });
   }
 }

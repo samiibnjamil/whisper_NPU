@@ -6,6 +6,8 @@ __pycache__/
 
 models/
 uploads/
+data/
+data/transcript-history.json
 
 *.pyc
 *.wav

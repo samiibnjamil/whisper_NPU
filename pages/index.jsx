@@ -31,6 +31,13 @@ function formatSeconds(value) {
   return `${minutes}m ${String(remainder).padStart(2, "0")}s`;
 }
 
+function formatDateTime(value) {
+  if (!value) return "Unknown time";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Unknown time";
+  return date.toLocaleString();
+}
+
 function usagePercent(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return 0;
   return Math.max(0, Math.min(100, value));
@@ -39,6 +46,12 @@ function usagePercent(value) {
 function usageValueLabel(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return "N/A";
   return `${value.toFixed(1)}%`;
+}
+
+function usageStatusLabel(label, value, unavailableReason) {
+  if (label !== "NPU") return usageValueLabel(value);
+  if (typeof value === "number" && !Number.isNaN(value)) return `${value.toFixed(1)}%`;
+  return unavailableReason ? "Unavailable" : "N/A";
 }
 
 function graphPoints(samples, rangeMinutes) {
@@ -62,6 +75,17 @@ export default function Home() {
   const [model, setModel] = useState("medium");
   const [status, setStatus] = useState("");
   const [transcript, setTranscript] = useState("");
+  const [transcriptCopied, setTranscriptCopied] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [expandedHistoryId, setExpandedHistoryId] = useState(null);
+  const [copiedHistoryId, setCopiedHistoryId] = useState(null);
+  const [playingId, setPlayingId] = useState(null);
+  const [audioProgress, setAudioProgress] = useState({});
+  const [audioDuration, setAudioDuration] = useState({});
+  const audioRefs = useRef({});
   const [splitSpeakers, setSplitSpeakers] = useState(false);
   const [showUsage, setShowUsage] = useState(false);
   const [usageView, setUsageView] = useState("graph");
@@ -74,6 +98,13 @@ export default function Home() {
     npuPercent: [],
   });
   const [loading, setLoading] = useState(false);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelLoaded, setModelLoaded] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  // queue: [{ id, name, file, status: "waiting"|"transcribing"|"done"|"error", progress, stage, elapsed, transcript, errorMsg }]
+  const [queue, setQueue] = useState([]);
+  const queueRef = useRef([]);
   const [progress, setProgress] = useState(0);
   const [stage, setStage] = useState("idle");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -82,6 +113,17 @@ export default function Home() {
   const dropRef = useRef(null);
   const transcriptionStartedAt = useRef(null);
   const xhrRef = useRef(null);
+  const loadModelXhrRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordingTimerRef = useRef(null);
+  const recordingStartedAt = useRef(null);
+  const waveformCanvasRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const analyserRef = useRef(null);
+  const autoLoadModelRef = useRef(null);
+  const transcriptCopyTimerRef = useRef(null);
+  const historyCopyTimerRef = useRef(null);
 
   useEffect(() => {
     const updateViewport = () => setViewportWidth(window.innerWidth || 1366);
@@ -89,6 +131,47 @@ export default function Home() {
     window.addEventListener("resize", updateViewport);
     return () => window.removeEventListener("resize", updateViewport);
   }, []);
+
+  useEffect(() => () => {
+    if (transcriptCopyTimerRef.current) window.clearTimeout(transcriptCopyTimerRef.current);
+    if (historyCopyTimerRef.current) window.clearTimeout(historyCopyTimerRef.current);
+    if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
+  }, []);
+
+  // Auto-load model on NPU at startup
+  useEffect(() => { autoLoadModelRef.current?.(); }, []);
+
+  useEffect(() => {
+    if (!recording || !analyserRef.current) return;
+    const analyser = analyserRef.current;
+    const buf = new Float32Array(analyser.fftSize);
+
+    const draw = () => {
+      animFrameRef.current = requestAnimationFrame(draw);
+      const canvas = waveformCanvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const W = canvas.width;
+      const H = canvas.height;
+      analyser.getFloatTimeDomainData(buf);
+      ctx.clearRect(0, 0, W, H);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#a78bfa";
+      ctx.beginPath();
+      const step = W / buf.length;
+      for (let i = 0; i < buf.length; i++) {
+        const x = i * step;
+        const y = (1 - (buf[i] * 0.9 + 1) / 2) * H;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    };
+    draw();
+    return () => {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    };
+  }, [recording]);
 
   useEffect(() => {
     if (!loading || stage !== "transcribing") return;
@@ -98,6 +181,142 @@ export default function Home() {
     }, 250);
     return () => window.clearInterval(timer);
   }, [loading, stage]);
+
+  // Queue processor: when not loading, pick the next waiting item and transcribe it
+  useEffect(() => {
+    if (loading) return;
+    const next = queue.find((item) => item.status === "waiting");
+    if (!next) return;
+
+    const updateItem = (id, patch) => {
+      setQueue((prev) => {
+        const updated = prev.map((item) => item.id === id ? { ...item, ...patch } : item);
+        queueRef.current = updated;
+        return updated;
+      });
+    };
+
+    updateItem(next.id, { status: "transcribing", stage: "uploading", progress: 0 });
+    setLoading(true);
+    setStage("uploading");
+    setStatus(`Transcribing: ${next.name}`);
+    setProgress(0);
+    setElapsedSeconds(0);
+    setFinalElapsedSeconds(null);
+    setTranscript("");
+    setTranscriptCopied(false);
+    setUsage(null);
+
+    const form = new FormData();
+    form.append("audio", next.file);
+    form.append("model", model);
+    form.append("showUsage", "1");
+
+    const xhr = new XMLHttpRequest();
+    xhrRef.current = xhr;
+    let responseOffset = 0;
+    let responseBuffer = "";
+    let completed = false;
+    const startedAt = { current: null };
+
+    const elapsedTimer = window.setInterval(() => {
+      if (!startedAt.current) return;
+      const s = (Date.now() - startedAt.current) / 1000;
+      setElapsedSeconds(s);
+      updateItem(next.id, { elapsed: s });
+    }, 250);
+
+    const handleEvent = (event) => {
+      if (event.type === "stage") {
+        setStage(event.stage);
+        setStatus(event.message || event.stage);
+        updateItem(next.id, { stage: event.stage });
+        if (["queued", "preparing", "loading_model"].includes(event.stage)) {
+          setProgress(0);
+          updateItem(next.id, { progress: 0 });
+        }
+        if (event.stage === "transcribing") {
+          startedAt.current = Date.now();
+          transcriptionStartedAt.current = startedAt.current;
+          setElapsedSeconds(0);
+          setProgress(0);
+          updateItem(next.id, { progress: 0 });
+        }
+      }
+      if (event.type === "progress") {
+        setStage(event.stage || "transcribing");
+        setStatus("Transcribing");
+        setProgress(event.progress ?? 0);
+        updateItem(next.id, { progress: event.progress ?? 0 });
+      }
+      if (event.type === "complete") {
+        completed = true;
+        setStage("complete");
+        setProgress(100);
+        setTranscript(event.transcript || "");
+        setFinalElapsedSeconds(event.elapsedSeconds ?? null);
+        setStatus("Done");
+        updateItem(next.id, { status: "done", progress: 100, stage: "complete", transcript: event.transcript || "" });
+        if (event.historyEntry) {
+          setHistory((current) => [event.historyEntry, ...current.filter((item) => item.id !== event.historyEntry.id)]);
+          setExpandedHistoryId(event.historyEntry.id);
+        }
+      }
+      if (event.type === "usage") setUsage(event);
+      if (event.type === "error") throw new Error(event.message || "Transcription failed");
+    };
+
+    const readEvents = () => {
+      responseBuffer += xhr.responseText.slice(responseOffset);
+      responseOffset = xhr.responseText.length;
+      const lines = responseBuffer.split(/\r?\n/);
+      responseBuffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        handleEvent(JSON.parse(line));
+      }
+    };
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const p = Math.round((e.loaded / e.total) * 100);
+      setStage("uploading"); setStatus("Uploading"); setProgress(p);
+      updateItem(next.id, { stage: "uploading", progress: p });
+    };
+    xhr.onprogress = () => { try { readEvents(); } catch (err) { setStatus(`Error: ${err.message}`); setStage("error"); setProgress(0); xhr.abort(); } };
+    xhr.onload = () => {
+      window.clearInterval(elapsedTimer);
+      try {
+        readEvents();
+        if (xhr.status < 200 || xhr.status >= 300) throw new Error(xhr.responseText || "Transcription failed");
+        if (!completed) throw new Error("Transcription ended without a completion event.");
+      } catch (err) {
+        setStatus(`Error: ${err.message}`);
+        setStage("error");
+        setProgress(0);
+        updateItem(next.id, { status: "error", stage: "error", errorMsg: err.message });
+      } finally {
+        setLoading(false);
+        xhrRef.current = null;
+      }
+    };
+    xhr.onerror = () => {
+      window.clearInterval(elapsedTimer);
+      setStatus("Error: Network request failed"); setStage("error"); setProgress(0);
+      updateItem(next.id, { status: "error", stage: "error", errorMsg: "Network request failed" });
+      setLoading(false); xhrRef.current = null;
+    };
+    xhr.onabort = () => {
+      window.clearInterval(elapsedTimer);
+      setStatus("Stopped"); setStage("stopped"); setProgress(0);
+      updateItem(next.id, { status: "error", stage: "stopped", errorMsg: "Stopped" });
+      setLoading(false); xhrRef.current = null;
+    };
+
+    xhr.open("POST", "/api/transcribe");
+    xhr.send(form);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, queue]);
 
   useEffect(() => {
     if (!showUsage) return;
@@ -133,9 +352,37 @@ export default function Home() {
     });
   }, [usage]);
 
+  useEffect(() => {
+    if (!historyOpen) return;
+    let cancelled = false;
+    const loadHistory = async () => {
+      setHistoryLoading(true);
+      setHistoryError("");
+      try {
+        const res = await fetch("/api/transcript-history");
+        if (!res.ok) throw new Error("Failed to load transcript history");
+        const data = await res.json();
+        if (!cancelled) {
+          const nextHistory = Array.isArray(data.history) ? data.history : [];
+          setHistory(nextHistory);
+          setExpandedHistoryId((current) => current ?? nextHistory[0]?.id ?? null);
+        }
+      } catch (err) {
+        if (!cancelled) setHistoryError(err.message || "Failed to load transcript history");
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    };
+    loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [historyOpen]);
+
   const onFile = (f) => {
     setFile(f);
     setTranscript("");
+    setTranscriptCopied(false);
     setStatus("");
     setProgress(0);
     setStage("idle");
@@ -145,55 +392,16 @@ export default function Home() {
     xhrRef.current = null;
   };
 
-  const submit = async () => {
-    if (!file) return;
-    setLoading(true);
-    setStage("uploading");
-    setStatus("Uploading");
-    setProgress(0);
-    setElapsedSeconds(0);
-    setFinalElapsedSeconds(null);
-    setTranscript("");
-    setUsage(null);
-
-    const form = new FormData();
-    form.append("audio", file);
-    form.append("model", model);
-    form.append("showUsage", "1");
+  const loadModelOnNpu = () => {
+    if (modelLoading) return;
+    setModelLoading(true);
+    setModelLoaded(false);
+    setStatus("Loading model on NPU...");
 
     const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
+    loadModelXhrRef.current = xhr;
     let responseOffset = 0;
     let responseBuffer = "";
-    let completed = false;
-
-    const handleEvent = (event) => {
-      if (event.type === "stage") {
-        setStage(event.stage);
-        setStatus(event.message || event.stage);
-        if (["queued", "preparing", "loading_model"].includes(event.stage)) setProgress(0);
-        if (event.stage === "transcribing") {
-          transcriptionStartedAt.current = Date.now();
-          setElapsedSeconds(0);
-          setProgress(0);
-        }
-      }
-      if (event.type === "progress") {
-        setStage(event.stage || "transcribing");
-        setStatus("Transcribing");
-        setProgress(event.progress ?? 0);
-      }
-      if (event.type === "complete") {
-        completed = true;
-        setStage("complete");
-        setProgress(100);
-        setTranscript(event.transcript || "");
-        setFinalElapsedSeconds(event.elapsedSeconds ?? null);
-        setStatus("Done");
-      }
-      if (event.type === "usage") setUsage(event);
-      if (event.type === "error") throw new Error(event.message || "Transcription failed");
-    };
 
     const readEvents = () => {
       responseBuffer += xhr.responseText.slice(responseOffset);
@@ -202,57 +410,168 @@ export default function Home() {
       responseBuffer = lines.pop() || "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        handleEvent(JSON.parse(line));
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "stage") setStatus(event.message || event.stage);
+          if (event.type === "complete") {
+            setModelLoaded(true);
+            setStatus("Model loaded — ready to transcribe");
+          }
+          if (event.type === "error") setStatus(`Error: ${event.message}`);
+        } catch {}
       }
     };
 
-    xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable) return;
-      setStage("uploading");
-      setStatus("Uploading");
-      setProgress(Math.round((event.loaded / event.total) * 100));
-    };
-    xhr.onprogress = () => {
-      try {
-        readEvents();
-      } catch (err) {
-        setStatus(`Error: ${err.message}`);
-        setStage("error");
-        setProgress(0);
-        xhr.abort();
-      }
-    };
+    xhr.onprogress = () => { try { readEvents(); } catch {} };
     xhr.onload = () => {
-      try {
-        readEvents();
-        if (xhr.status < 200 || xhr.status >= 300) throw new Error(xhr.responseText || "Transcription failed");
-        if (!completed) throw new Error("Transcription ended without a completion event.");
-      } catch (err) {
-        setStatus(`Error: ${err.message}`);
-        setStage("error");
-        setProgress(0);
-      } finally {
-        setLoading(false);
-        xhrRef.current = null;
-      }
+      try { readEvents(); } catch {}
+      setModelLoading(false);
+      loadModelXhrRef.current = null;
     };
     xhr.onerror = () => {
-      setStatus("Error: Network request failed");
-      setStage("error");
-      setProgress(0);
-      setLoading(false);
-      xhrRef.current = null;
-    };
-    xhr.onabort = () => {
-      setStatus("Stopped");
-      setStage("stopped");
-      setProgress(0);
-      setLoading(false);
-      xhrRef.current = null;
+      setStatus("Error: Failed to load model");
+      setModelLoading(false);
+      loadModelXhrRef.current = null;
     };
 
-    xhr.open("POST", "/api/transcribe");
-    xhr.send(form);
+    xhr.open("POST", `/api/load-model?model=${encodeURIComponent(model)}`);
+    xhr.send();
+  };
+  autoLoadModelRef.current = loadModelOnNpu;
+
+  const startRecording = async () => {
+    if (recording) return;
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setStatus("Error: Microphone access denied");
+      return;
+    }
+
+    audioChunksRef.current = [];
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+    const recorder = new MediaRecorder(stream, { mimeType });
+    mediaRecorderRef.current = recorder;
+
+    // Set up Web Audio analyser for waveform visualisation
+    const audioCtx = new AudioContext();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    analyserRef.current = analyser;
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunksRef.current.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      analyserRef.current = null;
+      audioCtx.close();
+
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+
+      const blob = new Blob(audioChunksRef.current, { type: mimeType });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const ext = mimeType.includes("webm") ? "webm" : "ogg";
+      const recordedFile = new File([blob], `recording-${timestamp}.${ext}`, { type: mimeType });
+
+      setRecording(false);
+
+      const queueItem = {
+        id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: recordedFile.name,
+        file: recordedFile,
+        status: "waiting",
+        progress: 0,
+        stage: "waiting",
+        elapsed: 0,
+        transcript: null,
+        errorMsg: null,
+      };
+      setQueue((prev) => {
+        const next = [...prev, queueItem];
+        queueRef.current = next;
+        return next;
+      });
+    };
+
+    recorder.start(100);
+    recordingStartedAt.current = Date.now();
+    setRecordingSeconds(0);
+    setRecording(true);
+    setStatus("Recording...");
+
+    recordingTimerRef.current = window.setInterval(() => {
+      setRecordingSeconds(Math.round((Date.now() - recordingStartedAt.current) / 1000));
+    }, 500);
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  // Manual transcribe for file-drop/browse (enqueues like recordings do)
+  const submit = () => {
+    if (!file) return;
+    const queueItem = {
+      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: file.name,
+      file,
+      status: "waiting",
+      progress: 0,
+      stage: "waiting",
+      elapsed: 0,
+      transcript: null,
+      errorMsg: null,
+    };
+    setQueue((prev) => {
+      const next = [...prev, queueItem];
+      queueRef.current = next;
+      return next;
+    });
+  };
+
+  const copyTranscript = async () => {
+    if (!transcript) return;
+    try {
+      await navigator.clipboard.writeText(transcript);
+      setTranscriptCopied(true);
+      if (transcriptCopyTimerRef.current) window.clearTimeout(transcriptCopyTimerRef.current);
+      transcriptCopyTimerRef.current = window.setTimeout(() => setTranscriptCopied(false), 1600);
+    } catch {
+      setStatus("Error: Could not copy transcript to clipboard");
+    }
+  };
+
+  const deleteHistoryEntry = async (id) => {
+    try {
+      await fetch(`/api/transcript-history?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      setHistory((current) => current.filter((e) => e.id !== id));
+      if (expandedHistoryId === id) setExpandedHistoryId(null);
+      if (playingId === id) setPlayingId(null);
+    } catch {
+      setStatus("Error: Could not delete entry");
+    }
+  };
+
+  const copyHistoryTranscript = async (entry) => {
+    if (!entry?.transcript) return;
+    try {
+      await navigator.clipboard.writeText(entry.transcript);
+      setCopiedHistoryId(entry.id);
+      if (historyCopyTimerRef.current) window.clearTimeout(historyCopyTimerRef.current);
+      historyCopyTimerRef.current = window.setTimeout(() => setCopiedHistoryId(null), 1600);
+    } catch {
+      setStatus("Error: Could not copy transcript to clipboard");
+    }
   };
 
   const showWideUsageLayout = showUsage && viewportWidth >= 1180;
@@ -285,8 +604,16 @@ export default function Home() {
             <div>Drop a file here or click to browse</div>
             {file && <div style={styles.chip}>{file.name}</div>}
           </div>
+          {recording && (
+            <canvas
+              ref={waveformCanvasRef}
+              width={700}
+              height={56}
+              style={styles.waveformCanvas}
+            />
+          )}
           <label style={styles.label} htmlFor="model">Whisper model</label>
-          <select id="model" value={model} onChange={(e) => setModel(e.target.value)} disabled={loading} style={styles.select}>
+          <select id="model" value={model} onChange={(e) => { setModel(e.target.value); setModelLoaded(false); }} disabled={loading || modelLoading} style={styles.select}>
             {MODELS.map((option) => <option key={option.value} value={option.value}>{option.label} - {option.detail}</option>)}
           </select>
           <label style={styles.toggleRow}>
@@ -295,21 +622,201 @@ export default function Home() {
             <span style={styles.toggleHint}>Requires speaker diarization</span>
           </label>
           <div style={styles.actions}>
-            <button style={styles.button} disabled={!file || loading} onClick={submit}>{loading ? "Transcribing..." : "Transcribe"}</button>
+            <button style={styles.button} disabled={!file || loading || recording} onClick={submit}>{loading ? "Transcribing..." : "Transcribe"}</button>
+            <button
+              style={{ ...styles.secondaryButton, ...(recording ? styles.recordingActiveButton : styles.recordButton) }}
+              disabled={modelLoading}
+              onClick={recording ? stopRecording : startRecording}
+              type="button"
+            >
+              {recording ? `Stop  ${formatSeconds(recordingSeconds)}` : "Record"}
+            </button>
+            <button
+              style={{ ...styles.secondaryButton, ...(modelLoaded ? styles.secondaryButtonActive : {}), ...(modelLoading ? styles.secondaryButtonLoading : {}) }}
+              disabled={loading || modelLoading}
+              onClick={loadModelOnNpu}
+              type="button"
+              title="Load the Whisper model onto the NPU so the first transcription starts faster"
+            >
+              {modelLoading ? "Loading..." : modelLoaded ? "Model Loaded" : "Load Model"}
+            </button>
             <button style={{ ...styles.secondaryButton, ...(showUsage ? styles.secondaryButtonActive : {}) }} onClick={() => setShowUsage((v) => !v)}>
               {showUsage ? "Hide Usage" : "Show Usage"}
             </button>
+            <button
+              style={{ ...styles.secondaryButton, ...(historyOpen ? styles.secondaryButtonActive : {}) }}
+              onClick={() => setHistoryOpen((v) => !v)}
+              type="button"
+            >
+              {historyOpen ? "Hide History" : "History"}
+            </button>
             {loading && <button style={styles.stopButton} onClick={() => xhrRef.current?.abort()}>Stop</button>}
           </div>
-          {(loading || progress > 0) && (
-            <div style={styles.progressWrap} aria-label="Transcription progress">
-              <div style={styles.progressMeta}><span>{progressLabel(stage)}</span><span>{isIndeterminateStage(stage) ? "Working" : `${progress}%`}</span></div>
-              <div style={styles.progressTrack}>{isIndeterminateStage(stage) ? <div className="indeterminateBar" style={styles.progressBarIndeterminate} /> : <div style={{ ...styles.progressBar, width: `${progress}%` }} />}</div>
-              {(stage === "transcribing" || finalElapsedSeconds !== null) && <div style={styles.elapsed}>Transcription time: {formatSeconds(finalElapsedSeconds ?? elapsedSeconds)}</div>}
+          {queue.length > 0 && (
+            <div style={styles.queuePanel}>
+              <div style={styles.queueHeader}>
+                <span style={styles.queueTitle}>Queue</span>
+                <span style={styles.queueSubtle}>
+                  {queue.filter((i) => i.status === "waiting").length} waiting
+                  {queue.filter((i) => i.status === "transcribing").length > 0 && " · 1 transcribing"}
+                  {queue.filter((i) => i.status === "done").length > 0 && ` · ${queue.filter((i) => i.status === "done").length} done`}
+                </span>
+              </div>
+              {queue.map((item) => (
+                <div key={item.id} style={{ ...styles.queueItem, ...(item.status === "transcribing" ? styles.queueItemActive : item.status === "done" ? styles.queueItemDone : item.status === "error" ? styles.queueItemError : {}) }}>
+                  <div style={styles.queueItemTop}>
+                    <span style={styles.queueItemName}>{item.name}</span>
+                    <span style={styles.queueItemBadge}>
+                      {item.status === "waiting" && "Waiting"}
+                      {item.status === "transcribing" && `${progressLabel(item.stage)} ${isIndeterminateStage(item.stage) ? "" : `${item.progress}%`}`}
+                      {item.status === "done" && `Done · ${formatSeconds(item.elapsed)}`}
+                      {item.status === "error" && (item.errorMsg === "Stopped" ? "Stopped" : "Error")}
+                    </span>
+                  </div>
+                  {item.status === "transcribing" && (
+                    <div style={styles.progressTrack}>
+                      {isIndeterminateStage(item.stage)
+                        ? <div className="indeterminateBar" style={styles.progressBarIndeterminate} />
+                        : <div style={{ ...styles.progressBar, width: `${item.progress}%` }} />}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           )}
           {status && <pre style={styles.status}>{status}</pre>}
-          {transcript && <div style={styles.transcript}><strong>Transcript</strong><div>{transcript}</div></div>}
+          {transcript && (
+            <div className="transcriptPanel" style={styles.transcript}>
+              <button
+                className="transcriptCopyButton"
+                type="button"
+                style={styles.transcriptCopyButton}
+                onClick={copyTranscript}
+                aria-label="Copy transcript"
+              >
+                {transcriptCopied ? "Copied" : "Copy"}
+              </button>
+              <strong>Transcript</strong>
+              <div style={styles.transcriptBody}>{transcript}</div>
+            </div>
+          )}
+          {historyOpen && (
+            <div style={styles.historyPanel}>
+              <div style={styles.historyHeader}>
+                <strong>Transcript History</strong>
+                <span style={styles.historySubtle}>Saved locally on this machine</span>
+              </div>
+              {historyLoading && <div style={styles.historyState}>Loading history...</div>}
+              {!historyLoading && historyError && <div style={styles.historyState}>{historyError}</div>}
+              {!historyLoading && !historyError && history.length === 0 && <div style={styles.historyState}>No saved transcripts yet.</div>}
+              {!historyLoading && !historyError && history.length > 0 && (
+                <div style={styles.historyList}>
+                  {history.map((item) => {
+                    const isExpanded = expandedHistoryId === item.id;
+                    const isPlaying = playingId === item.id;
+                    const progress = audioProgress[item.id] ?? 0;
+                    const duration = audioDuration[item.id] ?? 0;
+                    const audioSrc = item.audioFile ? `/api/recording/${encodeURIComponent(item.audioFile)}` : null;
+
+                    return (
+                      <article key={item.id} className="historySession" style={styles.historyItem}>
+                        {/* Header row: title + delete */}
+                        <div style={styles.historyItemHeadingRow}>
+                          <button
+                            type="button"
+                            style={styles.historyItemButton}
+                            onClick={() => setExpandedHistoryId((c) => c === item.id ? null : item.id)}
+                            aria-expanded={isExpanded}
+                          >
+                            <div style={styles.historyItemHeading}>
+                              <strong style={styles.historyItemTitle}>{item.fileName || "Unknown file"}</strong>
+                              <span style={styles.historyItemChevron}>{isExpanded ? "Hide" : "Show"}</span>
+                            </div>
+                            <div style={styles.historyItemMeta}>
+                              <span>{formatDateTime(item.savedAt)}</span>
+                              <span>{item.model || "unknown model"}</span>
+                              {typeof item.elapsedSeconds === "number" && <span>{formatSeconds(item.elapsedSeconds)}</span>}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            style={styles.historyDeleteButton}
+                            onClick={() => deleteHistoryEntry(item.id)}
+                            aria-label="Delete this recording"
+                            title="Delete"
+                          >✕</button>
+                        </div>
+
+                        {/* Audio player */}
+                        {audioSrc && (
+                          <div style={styles.audioPlayer}>
+                            <audio
+                              ref={(el) => { if (el) audioRefs.current[item.id] = el; else delete audioRefs.current[item.id]; }}
+                              src={audioSrc}
+                              preload="metadata"
+                              onLoadedMetadata={(e) => setAudioDuration((d) => ({ ...d, [item.id]: e.target.duration }))}
+                              onTimeUpdate={(e) => setAudioProgress((p) => ({ ...p, [item.id]: e.target.currentTime }))}
+                              onEnded={() => setPlayingId(null)}
+                            />
+                            <button
+                              type="button"
+                              style={styles.audioPlayButton}
+                              onClick={() => {
+                                const el = audioRefs.current[item.id];
+                                if (!el) return;
+                                if (isPlaying) { el.pause(); setPlayingId(null); }
+                                else {
+                                  Object.values(audioRefs.current).forEach((a) => { if (a !== el) { a.pause(); } });
+                                  setPlayingId(null);
+                                  el.play();
+                                  setPlayingId(item.id);
+                                }
+                              }}
+                              aria-label={isPlaying ? "Pause" : "Play"}
+                            >
+                              {isPlaying ? "⏸" : "▶"}
+                            </button>
+                            <div style={styles.audioTrackWrap}>
+                              <div
+                                style={styles.audioTrack}
+                                onClick={(e) => {
+                                  const el = audioRefs.current[item.id];
+                                  if (!el || !duration) return;
+                                  const rect = e.currentTarget.getBoundingClientRect();
+                                  el.currentTime = ((e.clientX - rect.left) / rect.width) * duration;
+                                }}
+                              >
+                                <div style={{ ...styles.audioFill, width: `${duration ? (progress / duration) * 100 : 0}%` }} />
+                              </div>
+                              <div style={styles.audioTime}>
+                                {formatSeconds(progress)} / {formatSeconds(duration)}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Transcript */}
+                        {isExpanded && (
+                          <div className="historyTranscriptPanel" style={styles.historyTranscriptPanel}>
+                            <button
+                              type="button"
+                              className="historyCopyButton"
+                              style={styles.historyCopyButton}
+                              onClick={() => copyHistoryTranscript(item)}
+                              aria-label={`Copy transcript from ${item.fileName || "session"}`}
+                            >
+                              {copiedHistoryId === item.id ? "Copied" : "Copy"}
+                            </button>
+                            <div style={styles.historyTranscript}>{item.transcript}</div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
           {showUsage && (
           <section style={styles.widgetsPane}>
@@ -354,9 +861,10 @@ export default function Home() {
             <div style={styles.widgetsGrid}>
               {[{ key: "cpuPercent", label: "CPU", color: "#22c55e" }, { key: "ramPercent", label: "RAM", color: "#38bdf8" }, { key: "gpuPercent", label: "GPU", color: "#f59e0b" }, { key: "npuPercent", label: "NPU", color: "#a78bfa" }].map((item) => {
                 const value = usage?.[item.key];
+                const isNpuUnavailable = item.key === "npuPercent" && usage?.npuTelemetryAvailable === false;
                 return (
                   <div key={item.key} style={styles.widgetCard}>
-                    <div style={styles.monitorRowTop}><span>{item.label}</span><span>{usageValueLabel(value)}</span></div>
+                    <div style={styles.monitorRowTop}><span>{item.label}</span><span>{usageStatusLabel(item.label, value, isNpuUnavailable)}</span></div>
                     {usageView === "bar" ? (
                       <div style={styles.monitorTrack}><div style={{ ...styles.monitorFill, width: `${usagePercent(value)}%`, background: item.color }} /></div>
                     ) : (
@@ -365,6 +873,7 @@ export default function Home() {
                         <polyline points={graphPoints(usageHistory[item.key], usageRangeMinutes)} fill="none" stroke={item.color} strokeWidth="2.5" vectorEffect="non-scaling-stroke" />
                       </svg>
                     )}
+                    {isNpuUnavailable && <div style={styles.monitorMeta}>{usage?.npuTelemetryReason}</div>}
                   </div>
                 );
               })}
@@ -372,7 +881,10 @@ export default function Home() {
             </section>
           )}
         </div>
-        <style jsx>{`@keyframes indeterminateProgress {0% {transform: translateX(-120%);}100% {transform: translateX(320%);}} .indeterminateBar {animation: indeterminateProgress 1.2s ease-in-out infinite;}`}</style>
+        <style jsx>{`
+          @keyframes indeterminateProgress {0% {transform: translateX(-120%);}100% {transform: translateX(320%);}}
+          .indeterminateBar {animation: indeterminateProgress 1.2s ease-in-out infinite;}
+        `}</style>
         <style jsx global>{`
           html,
           body,
@@ -384,6 +896,34 @@ export default function Home() {
 
           * {
             box-sizing: border-box;
+          }
+
+          .transcriptCopyButton {
+            opacity: 0;
+            transform: translateY(-2px);
+            pointer-events: none;
+            transition: opacity 140ms ease, transform 140ms ease, background-color 140ms ease, border-color 140ms ease;
+          }
+
+          .transcriptPanel:hover .transcriptCopyButton,
+          .transcriptPanel:focus-within .transcriptCopyButton {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: auto;
+          }
+
+          .historyCopyButton {
+            opacity: 0;
+            transform: translateY(-2px);
+            pointer-events: none;
+            transition: opacity 140ms ease, transform 140ms ease, background-color 140ms ease, border-color 140ms ease;
+          }
+
+          .historyTranscriptPanel:hover .historyCopyButton,
+          .historyTranscriptPanel:focus-within .historyCopyButton {
+            opacity: 1;
+            transform: translateY(0);
+            pointer-events: auto;
           }
         `}</style>
       </div>
@@ -412,7 +952,22 @@ const styles = {
   button: { padding: "12px 16px", border: "none", borderRadius: 10, background: "linear-gradient(120deg, #8b5cf6, #2563eb)", color: "#fff", fontWeight: 700, cursor: "pointer" },
   secondaryButton: { padding: "12px 16px", border: "1px solid rgba(148,163,184,0.4)", borderRadius: 10, background: "rgba(15,23,42,0.5)", color: "#cbd5e1", fontWeight: 700, cursor: "pointer" },
   secondaryButtonActive: { border: "1px solid rgba(56,189,248,0.65)", color: "#bae6fd", background: "rgba(14,116,144,0.22)" },
+  secondaryButtonLoading: { border: "1px solid rgba(167,139,250,0.5)", color: "#c4b5fd", background: "rgba(109,40,217,0.18)", cursor: "wait" },
   stopButton: { padding: "12px 16px", border: "1px solid rgba(248,113,113,0.45)", borderRadius: 10, background: "rgba(127,29,29,0.38)", color: "#fecaca", fontWeight: 700, cursor: "pointer" },
+  waveformCanvas: { display: "block", width: "100%", height: 56, marginTop: 10, borderRadius: 10, background: "rgba(167,139,250,0.07)", border: "1px solid rgba(167,139,250,0.25)" },
+  recordButton: { padding: "12px 16px", border: "1px solid rgba(248,113,113,0.45)", borderRadius: 10, background: "rgba(127,29,29,0.22)", color: "#fca5a5", fontWeight: 700, cursor: "pointer" },
+  recordingActiveButton: { padding: "12px 16px", border: "1px solid rgba(248,113,113,0.8)", borderRadius: 10, background: "rgba(185,28,28,0.45)", color: "#fecaca", fontWeight: 700, cursor: "pointer" },
+  queuePanel: { marginTop: 14, padding: "10px 12px", borderRadius: 12, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", display: "flex", flexDirection: "column", gap: 6 },
+  queueHeader: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 },
+  queueTitle: { fontWeight: 700, fontSize: 13, color: "#f8fafc" },
+  queueSubtle: { fontSize: 12, color: "#94a3b8" },
+  queueItem: { padding: "7px 10px", borderRadius: 8, background: "rgba(15,23,42,0.6)", border: "1px solid rgba(148,163,184,0.12)", display: "flex", flexDirection: "column", gap: 5 },
+  queueItemActive: { border: "1px solid rgba(167,139,250,0.45)", background: "rgba(109,40,217,0.12)" },
+  queueItemDone: { border: "1px solid rgba(34,197,94,0.3)", background: "rgba(20,83,45,0.18)" },
+  queueItemError: { border: "1px solid rgba(248,113,113,0.35)", background: "rgba(127,29,29,0.18)" },
+  queueItemTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
+  queueItemName: { fontSize: 12, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 },
+  queueItemBadge: { flexShrink: 0, fontSize: 11, color: "#94a3b8", fontWeight: 600 },
   progressWrap: { marginTop: 16 },
   progressMeta: { display: "flex", justifyContent: "space-between", gap: 12, color: "#cbd5e1", fontSize: 13, marginBottom: 8 },
   progressTrack: { height: 10, overflow: "hidden", borderRadius: 999, background: "rgba(148,163,184,0.22)", border: "1px solid rgba(255,255,255,0.06)" },
@@ -420,13 +975,38 @@ const styles = {
   progressBarIndeterminate: { width: "32%", height: "100%", borderRadius: 999, background: "linear-gradient(120deg, #22c55e, #38bdf8)" },
   elapsed: { marginTop: 8, color: "#94a3b8", fontSize: 13 },
   status: { marginTop: 14, maxHeight: 90, overflow: "auto", background: "#0b1020", color: "#e2e8f0", padding: 12, borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)", whiteSpace: "pre-wrap" },
-  transcript: { marginTop: 14, maxHeight: 140, overflow: "auto", padding: 12, borderRadius: 12, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", color: "#f8fafc" },
+  transcript: { marginTop: 14, maxHeight: 140, overflow: "auto", padding: 12, paddingTop: 40, borderRadius: 12, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", color: "#f8fafc", position: "relative" },
+  transcriptBody: { marginTop: 8, whiteSpace: "pre-wrap" },
+  transcriptCopyButton: { position: "absolute", top: 10, right: 10, border: "1px solid rgba(148,163,184,0.3)", borderRadius: 8, padding: "6px 10px", background: "rgba(15,23,42,0.92)", color: "#cbd5e1", fontSize: 12, fontWeight: 700, cursor: "pointer" },
+  historyPanel: { marginTop: 14, padding: 12, borderRadius: 12, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" },
+  historyHeader: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, marginBottom: 10, color: "#f8fafc" },
+  historySubtle: { color: "#94a3b8", fontSize: 12 },
+  historyState: { color: "#cbd5e1", fontSize: 14, padding: "8px 0" },
+  historyList: { maxHeight: 220, overflow: "auto", display: "grid", gap: 10 },
+  historyItem: { padding: 10, borderRadius: 10, background: "rgba(15,23,42,0.7)", border: "1px solid rgba(148,163,184,0.18)" },
+  historyItemHeadingRow: { display: "flex", alignItems: "flex-start", gap: 8 },
+  historyItemButton: { flex: 1, border: "none", background: "transparent", padding: 0, textAlign: "left", cursor: "pointer", color: "inherit", minWidth: 0 },
+  historyItemHeading: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8 },
+  historyItemTitle: { color: "#f8fafc", fontSize: 14 },
+  historyItemChevron: { color: "#94a3b8", fontSize: 12, fontWeight: 700 },
+  historyItemMeta: { display: "flex", flexWrap: "wrap", gap: 10, color: "#94a3b8", fontSize: 12 },
+  historyDeleteButton: { flexShrink: 0, border: "1px solid rgba(248,113,113,0.3)", borderRadius: 7, padding: "4px 8px", background: "transparent", color: "#f87171", fontSize: 12, cursor: "pointer", lineHeight: 1 },
+  audioPlayer: { display: "flex", alignItems: "center", gap: 8, marginTop: 8, padding: "6px 8px", borderRadius: 8, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" },
+  audioPlayButton: { flexShrink: 0, width: 30, height: 30, border: "1px solid rgba(167,139,250,0.5)", borderRadius: "50%", background: "rgba(109,40,217,0.25)", color: "#c4b5fd", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+  audioTrackWrap: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 },
+  audioTrack: { height: 6, borderRadius: 999, background: "rgba(148,163,184,0.25)", cursor: "pointer", position: "relative", overflow: "hidden" },
+  audioFill: { height: "100%", borderRadius: 999, background: "linear-gradient(90deg, #a78bfa, #818cf8)", transition: "width 100ms linear" },
+  audioTime: { color: "#94a3b8", fontSize: 11, textAlign: "right" },
+  historyTranscriptPanel: { marginTop: 10, paddingTop: 34, position: "relative" },
+  historyTranscript: { color: "#f8fafc", whiteSpace: "pre-wrap", fontSize: 14, lineHeight: 1.5 },
+  historyCopyButton: { position: "absolute", top: 0, right: 0, border: "1px solid rgba(148,163,184,0.3)", borderRadius: 8, padding: "6px 10px", background: "rgba(15,23,42,0.92)", color: "#cbd5e1", fontSize: 12, fontWeight: 700, cursor: "pointer" },
   widgetsPane: { width: "100%", minWidth: 0, maxHeight: "calc(100vh - 48px)", overflow: "hidden", boxSizing: "border-box", background: "rgba(2,6,23,0.78)", border: "1px solid rgba(148,163,184,0.25)", borderRadius: 16, padding: 14 },
   widgetsGrid: { marginTop: 10, display: "grid", gridTemplateColumns: "1fr", gap: 9 },
   widgetCard: { padding: 10, borderRadius: 10, background: "rgba(15,23,42,0.72)", border: "1px solid rgba(148,163,184,0.2)" },
   monitorHeader: { fontSize: 18, fontWeight: 700, color: "#f8fafc" },
   monitorHeaderRow: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 },
   monitorSubtle: { color: "#94a3b8", fontSize: 14, marginTop: 4 },
+  monitorMeta: { marginTop: 8, color: "#94a3b8", fontSize: 11, lineHeight: 1.45 },
   monitorControls: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 },
   viewToggle: { display: "inline-flex", padding: 3, borderRadius: 9, background: "rgba(15,23,42,0.72)", border: "1px solid rgba(148,163,184,0.22)" },
   viewToggleButton: { border: "none", borderRadius: 7, padding: "6px 9px", background: "transparent", color: "#94a3b8", fontWeight: 700, cursor: "pointer", fontSize: 12 },

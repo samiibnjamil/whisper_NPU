@@ -117,17 +117,49 @@ def read_ram_percent() -> float | None:
     return parse_first_float(out)
 
 
+def read_npu_telemetry() -> dict:
+    npu = read_counter_sum(r"\NPU Engine(*)\Utilization Percentage")
+    if npu is not None:
+        return {
+            "npuPercent": round(npu, 1),
+            "npuTelemetryAvailable": True,
+            "npuTelemetrySource": "perf-counter",
+            "npuTelemetryReason": None,
+        }
+
+    device_name = run_powershell(
+        "$device = Get-PnpDevice -Class ComputeAccelerator -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.FriendlyName -match 'NPU|AI Boost|Intel\\(R\\) AI' } | "
+        "Select-Object -First 1 -ExpandProperty FriendlyName; "
+        "if ($device) { $device }"
+    )
+    reason = (
+        f"{device_name} is present, but Windows is not exposing an NPU performance counter to PowerShell."
+        if device_name
+        else "No NPU performance counter was found."
+    )
+    return {
+        "npuPercent": None,
+        "npuTelemetryAvailable": False,
+        "npuTelemetrySource": None,
+        "npuTelemetryReason": reason,
+    }
+
+
 def read_utilization_snapshot() -> dict:
     try:
         cpu = read_counter(r"\Processor(_Total)\% Processor Time")
         ram = read_ram_percent()
         gpu = read_counter_sum(r"\GPU Engine(*)\Utilization Percentage")
-        npu = read_counter_sum(r"\NPU Engine(*)\Utilization Percentage")
+        npu = read_npu_telemetry()
         return {
             "cpuPercent": round(cpu, 1) if cpu is not None else None,
             "ramPercent": round(ram, 1) if ram is not None else None,
             "gpuPercent": round(gpu, 1) if gpu is not None else None,
-            "npuPercent": round(npu, 1) if npu is not None else None,
+            "npuPercent": npu["npuPercent"],
+            "npuTelemetryAvailable": npu["npuTelemetryAvailable"],
+            "npuTelemetrySource": npu["npuTelemetrySource"],
+            "npuTelemetryReason": npu["npuTelemetryReason"],
         }
     except Exception:
         return {}
@@ -151,6 +183,9 @@ def start_usage_emitter(enabled: bool, progress_enabled: bool):
                     "ramPercent": usage.get("ramPercent"),
                     "gpuPercent": usage.get("gpuPercent"),
                     "npuPercent": usage.get("npuPercent"),
+                    "npuTelemetryAvailable": usage.get("npuTelemetryAvailable"),
+                    "npuTelemetrySource": usage.get("npuTelemetrySource"),
+                    "npuTelemetryReason": usage.get("npuTelemetryReason"),
                 },
             )
             stop_event.wait(1.2)
@@ -164,7 +199,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Whisper on Intel NPU with OpenVINO GenAI")
     parser.add_argument(
         "--audio",
-        required=True,
+        required=False,
         type=Path,
         help="Path to audio file to transcribe. WAV preferred; M4A/other formats will be converted with ffmpeg if available.",
     )
@@ -188,6 +223,11 @@ def main() -> None:
         "--emit-usage",
         action="store_true",
         help="Emit periodic CPU/RAM/GPU/NPU usage samples as JSON events.",
+    )
+    parser.add_argument(
+        "--preload-only",
+        action="store_true",
+        help="Load and compile the model on the NPU, then exit without transcribing. Warms the NPU compile cache.",
     )
     args = parser.parse_args()
 
@@ -221,17 +261,27 @@ def main() -> None:
 
         return tmp, cleanup
 
-    emit_progress(args.progress_json, {"type": "stage", "stage": "preparing", "message": "Preparing audio"})
-    audio_path, cleanup = convert_to_wav_if_needed(args.audio)
-
     core = Core()
     ensure_npu_available(core)
 
-    audio = load_audio(audio_path)
+    if not args.preload_only:
+        if not args.audio:
+            raise ValueError("--audio is required unless --preload-only is set.")
+        emit_progress(args.progress_json, {"type": "stage", "stage": "preparing", "message": "Preparing audio"})
+        audio_path, cleanup = convert_to_wav_if_needed(args.audio)
+        audio = load_audio(audio_path)
+    else:
+        audio_path = None
+        cleanup = lambda: None
+        audio = None
 
     # Initialize Whisper on NPU. If the device is unavailable, this raises instead of falling back.
     emit_progress(args.progress_json, {"type": "stage", "stage": "loading_model", "message": "Loading model on NPU"})
     pipeline = WhisperPipeline(models_path=str(args.model_dir), device="NPU")
+
+    if args.preload_only:
+        emit_progress(args.progress_json, {"type": "complete", "message": "Model loaded and ready"})
+        return
 
     # Basic generation settings; adjust if you want timestamps or different decoding.
     gen_cfg = WhisperGenerationConfig()

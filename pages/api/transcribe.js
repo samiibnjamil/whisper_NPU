@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import formidable from "formidable";
+import { appendTranscriptHistory } from "../../lib/transcript-history";
 
 const MODEL_DIRS = {
   small: "whisper-small-openvino-stateless",
@@ -61,7 +62,16 @@ export default async function handler(req, res) {
     }
 
     const audioPath = Array.isArray(file) ? file[0].filepath : file.filepath;
+    const originalFilename = Array.isArray(file) ? file[0].originalFilename : file.originalFilename;
     const projectRoot = process.cwd();
+
+    // Save a permanent copy of the audio before transcription
+    const recordingsDir = path.join(projectRoot, "data", "recordings");
+    if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
+    const audioExt = path.extname(originalFilename || audioPath) || ".webm";
+    const audioSaveId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const savedAudioPath = path.join(recordingsDir, `${audioSaveId}${audioExt}`);
+    try { fs.copyFileSync(audioPath, savedAudioPath); } catch { /* non-fatal */ }
     const pythonBin = path.join(projectRoot, ".venv", "Scripts", "python.exe");
     const scriptPath = path.join(projectRoot, "whisper_npu.py");
     const modelDir = path.join(projectRoot, "models", modelFolder);
@@ -108,7 +118,19 @@ export default async function handler(req, res) {
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
-          writeEvent(res, JSON.parse(line));
+          const event = JSON.parse(line);
+          if (event.type === "complete" && event.transcript) {
+            const historyEntry = appendTranscriptHistory({
+              transcript: event.transcript,
+              model: modelKey,
+              elapsedSeconds: event.elapsedSeconds ?? null,
+              fileName: originalFilename || path.basename(audioPath),
+              audioFile: fs.existsSync(savedAudioPath) ? `${audioSaveId}${audioExt}` : null,
+            });
+            writeEvent(res, { ...event, historyEntry });
+            continue;
+          }
+          writeEvent(res, event);
         } catch {
           writeEvent(res, { type: "log", message: line });
         }
