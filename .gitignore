@@ -8,6 +8,7 @@ models/
 uploads/
 data/
 data/transcript-history.json
+third_party/
 
 .dev-server.log
 *.pyc

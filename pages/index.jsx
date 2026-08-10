@@ -1,10 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import Head from "next/head";
 
-const MODELS = [
-  { value: "medium", label: "Whisper Medium.en", detail: "Higher accuracy" },
-  { value: "small", label: "Whisper Small", detail: "Faster" },
+const ENGINES = [
+  { value: "whisper", label: "Whisper (Intel NPU)" },
+  { value: "vibevoice", label: "VibeVoice BitNet (CPU)" },
 ];
+const MODELS_BY_ENGINE = {
+  whisper: [
+    { value: "medium", label: "Whisper Medium.en", detail: "Higher accuracy" },
+    { value: "small", label: "Whisper Small", detail: "Faster" },
+  ],
+  vibevoice: [
+    { value: "bitnet", label: "VibeVoice ASR BitNet", detail: "Quantized, CPU-only" },
+  ],
+};
+const DEFAULT_MODEL_BY_ENGINE = { whisper: "medium", vibevoice: "bitnet" };
 const USAGE_KEYS = ["cpuPercent", "ramPercent", "gpuPercent", "npuPercent"];
 const USAGE_RANGES = [1, 2, 5, 10];
 const MAX_USAGE_HISTORY_MS = 10 * 60 * 1000;
@@ -14,8 +24,8 @@ function progressLabel(stage) {
   if (stage === "uploading") return "Uploading";
   if (stage === "queued") return "Starting";
   if (stage === "preparing") return "Preparing audio";
-  if (stage === "loading_model") return "Loading model on NPU";
-  if (stage === "transcribing") return "Transcribing on NPU";
+  if (stage === "loading_model") return "Loading model";
+  if (stage === "transcribing") return "Transcribing";
   if (stage === "complete") return "Complete";
   return "Progress";
 }
@@ -73,7 +83,8 @@ function graphPoints(samples, rangeMinutes) {
 
 export default function Home() {
   const [file, setFile] = useState(null);
-  const [model, setModel] = useState("medium");
+  const [engine, setEngine] = useState("vibevoice");
+  const [model, setModel] = useState("bitnet");
   const [status, setStatus] = useState("");
   const [transcript, setTranscript] = useState("");
   const [transcriptCopied, setTranscriptCopied] = useState(false);
@@ -124,7 +135,6 @@ export default function Home() {
   const waveformCanvasRef = useRef(null);
   const animFrameRef = useRef(null);
   const analyserRef = useRef(null);
-  const autoLoadModelRef = useRef(null);
   const transcriptCopyTimerRef = useRef(null);
   const historyCopyTimerRef = useRef(null);
 
@@ -157,9 +167,6 @@ export default function Home() {
       URL.revokeObjectURL(objectUrl);
     };
   }, [file]);
-
-  // Auto-load model on NPU at startup
-  useEffect(() => { autoLoadModelRef.current?.(); }, []);
 
   useEffect(() => {
     if (!recording || !analyserRef.current) return;
@@ -229,6 +236,7 @@ export default function Home() {
 
     const form = new FormData();
     form.append("audio", next.file);
+    form.append("engine", engine);
     form.append("model", model);
     form.append("showUsage", "1");
 
@@ -605,10 +613,9 @@ export default function Home() {
       loadModelXhrRef.current = null;
     };
 
-    xhr.open("POST", `/api/load-model?model=${encodeURIComponent(model)}`);
+    xhr.open("POST", `/api/load-model?engine=${encodeURIComponent(engine)}&model=${encodeURIComponent(model)}`);
     xhr.send();
   };
-  autoLoadModelRef.current = loadModelOnNpu;
 
   const startRecording = async () => {
     if (recording) return;
@@ -769,9 +776,12 @@ export default function Home() {
           }}
         >
           <div style={{ ...styles.card, ...(showWideUsageLayout ? styles.cardShifted : {}) }}>
-          <div style={styles.pill}><span style={styles.badge}>NPU</span>Intel AI Boost - Whisper (OpenVINO)</div>
+          <div style={styles.pill}>
+            <span style={styles.badge}>{engine === "vibevoice" ? "CPU" : "NPU"}</span>
+            {engine === "vibevoice" ? "VibeVoice ASR BitNet (ggml)" : "Intel AI Boost - Whisper (OpenVINO)"}
+          </div>
           <h1 style={styles.title}>Transcribe locally</h1>
-          <p style={styles.subtitle}>Drag & drop audio (.wav, .m4a, .mp3). All inference stays on-device via your NPU.</p>
+          <p style={styles.subtitle}>Drag & drop audio (.wav, .m4a, .mp3). All inference stays on-device{engine === "vibevoice" ? " on CPU." : " via your NPU."}</p>
           <div ref={dropRef} style={styles.drop} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer?.files?.[0]; if (f) onFile(f); }}>
             <input type="file" accept="audio/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); }} style={styles.input} />
             <div>Drop a file here or click to browse</div>
@@ -786,9 +796,24 @@ export default function Home() {
               style={styles.waveformCanvas}
             />
           )}
-          <label style={styles.label} htmlFor="model">Whisper model</label>
+          <label style={styles.label} htmlFor="engine">Engine</label>
+          <select
+            id="engine"
+            value={engine}
+            onChange={(e) => {
+              const nextEngine = e.target.value;
+              setEngine(nextEngine);
+              setModel(DEFAULT_MODEL_BY_ENGINE[nextEngine]);
+              setModelLoaded(false);
+            }}
+            disabled={loading || modelLoading}
+            style={styles.select}
+          >
+            {ENGINES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+          </select>
+          <label style={styles.label} htmlFor="model">Model</label>
           <select id="model" value={model} onChange={(e) => { setModel(e.target.value); setModelLoaded(false); }} disabled={loading || modelLoading} style={styles.select}>
-            {MODELS.map((option) => <option key={option.value} value={option.value}>{option.label} - {option.detail}</option>)}
+            {MODELS_BY_ENGINE[engine].map((option) => <option key={option.value} value={option.value}>{option.label} - {option.detail}</option>)}
           </select>
           <label style={styles.toggleRow}>
             <input type="checkbox" checked={splitSpeakers} onChange={(e) => setSplitSpeakers(e.target.checked)} disabled />

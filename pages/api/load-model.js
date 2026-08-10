@@ -1,9 +1,5 @@
 import { loadModel, getModelStatus } from "../../lib/model-process";
-
-const MODEL_DIRS = {
-  small: "whisper-small-openvino-stateless",
-  medium: "whisper-medium-en-openvino-stateless",
-};
+import { resolveEngineModel } from "../../lib/engines";
 
 export default function handler(req, res) {
   if (req.method !== "POST") {
@@ -11,14 +7,16 @@ export default function handler(req, res) {
     return;
   }
 
+  const engineKey = req.query?.engine || "whisper";
   const modelKey = req.query?.model || "medium";
-  const modelFolder = MODEL_DIRS[modelKey];
-  if (!modelFolder) {
-    res.status(400).send(`Unsupported model '${modelKey}'.`);
+  const resolved = resolveEngineModel(engineKey, modelKey);
+  if (!resolved) {
+    res.status(400).send(`Unsupported engine/model combination '${engineKey}/${modelKey}'.`);
     return;
   }
+  const { engine, model } = resolved;
 
-  const status = getModelStatus(modelKey);
+  const status = getModelStatus(engineKey, modelKey);
   if (status === "ready") {
     res.writeHead(200, {
       "Content-Type": "application/x-ndjson; charset=utf-8",
@@ -37,8 +35,10 @@ export default function handler(req, res) {
   });
 
   const unsubscribe = loadModel({
+    engineKey,
     modelKey,
-    modelFolder,
+    scriptName: engine.script,
+    modelFolder: model.folder,
     projectRoot: process.cwd(),
     onEvent: (event) => {
       if (!res.writableEnded && !res.destroyed) {

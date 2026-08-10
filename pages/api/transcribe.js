@@ -3,11 +3,7 @@ import path from "path";
 import fs from "fs";
 import formidable from "formidable";
 import { appendTranscriptHistory } from "../../lib/transcript-history";
-
-const MODEL_DIRS = {
-  small: "whisper-small-openvino-stateless",
-  medium: "whisper-medium-en-openvino-stateless",
-};
+import { resolveEngineModel } from "../../lib/engines";
 
 function writeEvent(res, event) {
   if (!res.writableEnded && !res.destroyed) {
@@ -51,15 +47,19 @@ export default async function handler(req, res) {
       return;
     }
 
+    const requestedEngine = Array.isArray(fields.engine) ? fields.engine[0] : fields.engine;
     const requestedModel = Array.isArray(fields.model) ? fields.model[0] : fields.model;
     const showUsageRaw = Array.isArray(fields.showUsage) ? fields.showUsage[0] : fields.showUsage;
     const showUsage = showUsageRaw === "1";
+    const engineKey = requestedEngine || "whisper";
     const modelKey = requestedModel || "medium";
-    const modelFolder = MODEL_DIRS[modelKey];
-    if (!modelFolder) {
-      res.status(400).send(`Unsupported model '${modelKey}'.`);
+    const resolved = resolveEngineModel(engineKey, modelKey);
+    if (!resolved) {
+      res.status(400).send(`Unsupported engine/model combination '${engineKey}/${modelKey}'.`);
       return;
     }
+    const { engine, model: modelInfo } = resolved;
+    const modelFolder = modelInfo.folder;
 
     const audioPath = Array.isArray(file) ? file[0].filepath : file.filepath;
     const originalFilename = Array.isArray(file) ? file[0].originalFilename : file.originalFilename;
@@ -73,7 +73,7 @@ export default async function handler(req, res) {
     const savedAudioPath = path.join(recordingsDir, `${audioSaveId}${audioExt}`);
     try { fs.copyFileSync(audioPath, savedAudioPath); } catch { /* non-fatal */ }
     const pythonBin = path.join(projectRoot, ".venv", "Scripts", "python.exe");
-    const scriptPath = path.join(projectRoot, "whisper_npu.py");
+    const scriptPath = path.join(projectRoot, engine.script);
     const modelDir = path.join(projectRoot, "models", modelFolder);
 
     const args = [
@@ -82,10 +82,11 @@ export default async function handler(req, res) {
       audioPath,
       "--model-dir",
       modelDir,
-      "--language",
-      "en",
       "--progress-json",
     ];
+    if (engineKey === "whisper") {
+      args.push("--language", "en");
+    }
     if (showUsage) {
       args.push("--emit-usage");
     }
