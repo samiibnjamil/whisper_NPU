@@ -9,6 +9,7 @@ uploads/
 data/
 data/transcript-history.json
 
+.dev-server.log
 *.pyc
 *.wav
 *.mp3

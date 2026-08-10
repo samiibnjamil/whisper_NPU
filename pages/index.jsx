@@ -8,6 +8,7 @@ const MODELS = [
 const USAGE_KEYS = ["cpuPercent", "ramPercent", "gpuPercent", "npuPercent"];
 const USAGE_RANGES = [1, 2, 5, 10];
 const MAX_USAGE_HISTORY_MS = 10 * 60 * 1000;
+const CURRENT_FILE_AUDIO_ID = "__current-file-audio__";
 
 function progressLabel(stage) {
   if (stage === "uploading") return "Uploading";
@@ -85,6 +86,8 @@ export default function Home() {
   const [playingId, setPlayingId] = useState(null);
   const [audioProgress, setAudioProgress] = useState({});
   const [audioDuration, setAudioDuration] = useState({});
+  const [audioVolume, setAudioVolume] = useState({});
+  const [currentFileAudioUrl, setCurrentFileAudioUrl] = useState("");
   const audioRefs = useRef({});
   const [splitSpeakers, setSplitSpeakers] = useState(false);
   const [showUsage, setShowUsage] = useState(false);
@@ -136,7 +139,24 @@ export default function Home() {
     if (transcriptCopyTimerRef.current) window.clearTimeout(transcriptCopyTimerRef.current);
     if (historyCopyTimerRef.current) window.clearTimeout(historyCopyTimerRef.current);
     if (recordingTimerRef.current) window.clearInterval(recordingTimerRef.current);
+    Object.values(audioRefs.current).forEach((audio) => audio?.pause?.());
   }, []);
+
+  useEffect(() => {
+    if (!file) {
+      setCurrentFileAudioUrl("");
+      setAudioProgress((current) => ({ ...current, [CURRENT_FILE_AUDIO_ID]: 0 }));
+      setAudioDuration((current) => ({ ...current, [CURRENT_FILE_AUDIO_ID]: 0 }));
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    setCurrentFileAudioUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [file]);
 
   // Auto-load model on NPU at startup
   useEffect(() => { autoLoadModelRef.current?.(); }, []);
@@ -380,7 +400,10 @@ export default function Home() {
   }, [historyOpen]);
 
   const onFile = (f) => {
+    const currentAudio = audioRefs.current[CURRENT_FILE_AUDIO_ID];
+    if (currentAudio) currentAudio.pause();
     setFile(f);
+    setPlayingId((current) => current === CURRENT_FILE_AUDIO_ID ? null : current);
     setTranscript("");
     setTranscriptCopied(false);
     setStatus("");
@@ -390,6 +413,154 @@ export default function Home() {
     setFinalElapsedSeconds(null);
     setUsage(null);
     xhrRef.current = null;
+  };
+
+  const syncAudioState = (id, audio) => {
+    if (!audio) return;
+    setAudioProgress((current) => ({ ...current, [id]: audio.currentTime || 0 }));
+    setAudioDuration((current) => ({ ...current, [id]: audio.duration || 0 }));
+    setAudioVolume((current) => ({ ...current, [id]: Number.isFinite(audio.volume) ? audio.volume : 1 }));
+  };
+
+  const pauseOtherAudio = (activeId) => {
+    Object.entries(audioRefs.current).forEach(([id, audio]) => {
+      if (!audio || id === activeId) return;
+      audio.pause();
+    });
+  };
+
+  const toggleAudioPlayback = async (id) => {
+    const audio = audioRefs.current[id];
+    if (!audio) return;
+
+    if (playingId === id && !audio.paused) {
+      audio.pause();
+      setPlayingId(null);
+      return;
+    }
+
+    pauseOtherAudio(id);
+    try {
+      await audio.play();
+      setPlayingId(id);
+    } catch {
+      setStatus("Error: Could not play audio");
+    }
+  };
+
+  const seekAudio = (id, nextTime) => {
+    const audio = audioRefs.current[id];
+    const duration = audio?.duration || audioDuration[id] || 0;
+    if (!audio || !duration) return;
+
+    const clampedTime = Math.max(0, Math.min(duration, nextTime));
+    audio.currentTime = clampedTime;
+    setAudioProgress((current) => ({ ...current, [id]: clampedTime }));
+  };
+
+  const skipAudio = (id, deltaSeconds) => {
+    const audio = audioRefs.current[id];
+    if (!audio) return;
+    seekAudio(id, (audio.currentTime || 0) + deltaSeconds);
+  };
+
+  const setAudioVolumeLevel = (id, nextVolume) => {
+    const audio = audioRefs.current[id];
+    const clampedVolume = Math.max(0, Math.min(1, nextVolume));
+    if (audio) audio.volume = clampedVolume;
+    setAudioVolume((current) => ({ ...current, [id]: clampedVolume }));
+  };
+
+  const renderAudioPlayer = ({ id, src }) => {
+    if (!src) return null;
+
+    const progressValue = audioProgress[id] ?? 0;
+    const durationValue = audioDuration[id] ?? 0;
+    const volumeValue = audioVolume[id] ?? 1;
+    const isPlaying = playingId === id;
+
+    return (
+      <div style={styles.audioPlayer}>
+        <audio
+          ref={(el) => {
+            if (el) audioRefs.current[id] = el;
+            else delete audioRefs.current[id];
+          }}
+          src={src}
+          preload="metadata"
+          onLoadedMetadata={(e) => syncAudioState(id, e.target)}
+          onDurationChange={(e) => syncAudioState(id, e.target)}
+          onTimeUpdate={(e) => setAudioProgress((current) => ({ ...current, [id]: e.target.currentTime }))}
+          onVolumeChange={(e) => setAudioVolume((current) => ({ ...current, [id]: e.target.volume }))}
+          onPlay={() => {
+            pauseOtherAudio(id);
+            setPlayingId(id);
+          }}
+          onPause={() => setPlayingId((current) => current === id ? null : current)}
+          onEnded={() => setPlayingId((current) => current === id ? null : current)}
+        />
+        <div style={styles.audioControls}>
+          <div style={styles.audioControlsRow}>
+            <button
+              type="button"
+              style={styles.audioTransportButton}
+              onClick={() => skipAudio(id, -10)}
+              aria-label="Rewind 10 seconds"
+              title="Rewind 10 seconds"
+            >
+              -10s
+            </button>
+            <button
+              type="button"
+              style={styles.audioPlayButton}
+              onClick={() => toggleAudioPlayback(id)}
+              aria-label={isPlaying ? "Pause" : "Play"}
+            >
+              {isPlaying ? "Pause" : "Play"}
+            </button>
+            <button
+              type="button"
+              style={styles.audioTransportButton}
+              onClick={() => skipAudio(id, 10)}
+              aria-label="Fast forward 10 seconds"
+              title="Fast forward 10 seconds"
+            >
+              +10s
+            </button>
+            <div style={styles.audioTime}>
+              {formatSeconds(progressValue)} / {formatSeconds(durationValue)}
+            </div>
+          </div>
+          <div style={styles.audioSliderRow}>
+            <input
+              type="range"
+              min={0}
+              max={durationValue || 0}
+              step={0.1}
+              value={Math.min(progressValue, durationValue || 0)}
+              onChange={(e) => seekAudio(id, Number(e.target.value))}
+              style={styles.audioSlider}
+              aria-label="Playback position"
+              disabled={!durationValue}
+            />
+          </div>
+          <div style={styles.audioVolumeRow}>
+            <span style={styles.audioVolumeLabel}>Volume</span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={volumeValue}
+              onChange={(e) => setAudioVolumeLevel(id, Number(e.target.value))}
+              style={styles.audioVolumeSlider}
+              aria-label="Volume"
+            />
+            <span style={styles.audioVolumeValue}>{Math.round(volumeValue * 100)}%</span>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const loadModelOnNpu = () => {
@@ -415,7 +586,7 @@ export default function Home() {
           if (event.type === "stage") setStatus(event.message || event.stage);
           if (event.type === "complete") {
             setModelLoaded(true);
-            setStatus("Model loaded — ready to transcribe");
+            setStatus("Model loaded - ready to transcribe");
           }
           if (event.type === "error") setStatus(`Error: ${event.message}`);
         } catch {}
@@ -553,6 +724,8 @@ export default function Home() {
 
   const deleteHistoryEntry = async (id) => {
     try {
+      const audio = audioRefs.current[id];
+      if (audio) audio.pause();
       await fetch(`/api/transcript-history?id=${encodeURIComponent(id)}`, { method: "DELETE" });
       setHistory((current) => current.filter((e) => e.id !== id));
       if (expandedHistoryId === id) setExpandedHistoryId(null);
@@ -596,7 +769,7 @@ export default function Home() {
           }}
         >
           <div style={{ ...styles.card, ...(showWideUsageLayout ? styles.cardShifted : {}) }}>
-          <div style={styles.pill}><span style={styles.badge}>NPU</span>Intel AI Boost · Whisper (OpenVINO)</div>
+          <div style={styles.pill}><span style={styles.badge}>NPU</span>Intel AI Boost - Whisper (OpenVINO)</div>
           <h1 style={styles.title}>Transcribe locally</h1>
           <p style={styles.subtitle}>Drag & drop audio (.wav, .m4a, .mp3). All inference stays on-device via your NPU.</p>
           <div ref={dropRef} style={styles.drop} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer?.files?.[0]; if (f) onFile(f); }}>
@@ -604,6 +777,7 @@ export default function Home() {
             <div>Drop a file here or click to browse</div>
             {file && <div style={styles.chip}>{file.name}</div>}
           </div>
+          {currentFileAudioUrl && renderAudioPlayer({ id: CURRENT_FILE_AUDIO_ID, src: currentFileAudioUrl })}
           {recording && (
             <canvas
               ref={waveformCanvasRef}
@@ -658,8 +832,8 @@ export default function Home() {
                 <span style={styles.queueTitle}>Queue</span>
                 <span style={styles.queueSubtle}>
                   {queue.filter((i) => i.status === "waiting").length} waiting
-                  {queue.filter((i) => i.status === "transcribing").length > 0 && " · 1 transcribing"}
-                  {queue.filter((i) => i.status === "done").length > 0 && ` · ${queue.filter((i) => i.status === "done").length} done`}
+                  {queue.filter((i) => i.status === "transcribing").length > 0 && " - 1 transcribing"}
+                  {queue.filter((i) => i.status === "done").length > 0 && ` - ${queue.filter((i) => i.status === "done").length} done`}
                 </span>
               </div>
               {queue.map((item) => (
@@ -669,7 +843,7 @@ export default function Home() {
                     <span style={styles.queueItemBadge}>
                       {item.status === "waiting" && "Waiting"}
                       {item.status === "transcribing" && `${progressLabel(item.stage)} ${isIndeterminateStage(item.stage) ? "" : `${item.progress}%`}`}
-                      {item.status === "done" && `Done · ${formatSeconds(item.elapsed)}`}
+                      {item.status === "done" && `Done - ${formatSeconds(item.elapsed)}`}
                       {item.status === "error" && (item.errorMsg === "Stopped" ? "Stopped" : "Error")}
                     </span>
                   </div>
@@ -713,9 +887,6 @@ export default function Home() {
                 <div style={styles.historyList}>
                   {history.map((item) => {
                     const isExpanded = expandedHistoryId === item.id;
-                    const isPlaying = playingId === item.id;
-                    const progress = audioProgress[item.id] ?? 0;
-                    const duration = audioDuration[item.id] ?? 0;
                     const audioSrc = item.audioFile ? `/api/recording/${encodeURIComponent(item.audioFile)}` : null;
 
                     return (
@@ -744,56 +915,11 @@ export default function Home() {
                             onClick={() => deleteHistoryEntry(item.id)}
                             aria-label="Delete this recording"
                             title="Delete"
-                          >✕</button>
+                          >X</button>
                         </div>
 
                         {/* Audio player */}
-                        {audioSrc && (
-                          <div style={styles.audioPlayer}>
-                            <audio
-                              ref={(el) => { if (el) audioRefs.current[item.id] = el; else delete audioRefs.current[item.id]; }}
-                              src={audioSrc}
-                              preload="metadata"
-                              onLoadedMetadata={(e) => setAudioDuration((d) => ({ ...d, [item.id]: e.target.duration }))}
-                              onTimeUpdate={(e) => setAudioProgress((p) => ({ ...p, [item.id]: e.target.currentTime }))}
-                              onEnded={() => setPlayingId(null)}
-                            />
-                            <button
-                              type="button"
-                              style={styles.audioPlayButton}
-                              onClick={() => {
-                                const el = audioRefs.current[item.id];
-                                if (!el) return;
-                                if (isPlaying) { el.pause(); setPlayingId(null); }
-                                else {
-                                  Object.values(audioRefs.current).forEach((a) => { if (a !== el) { a.pause(); } });
-                                  setPlayingId(null);
-                                  el.play();
-                                  setPlayingId(item.id);
-                                }
-                              }}
-                              aria-label={isPlaying ? "Pause" : "Play"}
-                            >
-                              {isPlaying ? "⏸" : "▶"}
-                            </button>
-                            <div style={styles.audioTrackWrap}>
-                              <div
-                                style={styles.audioTrack}
-                                onClick={(e) => {
-                                  const el = audioRefs.current[item.id];
-                                  if (!el || !duration) return;
-                                  const rect = e.currentTarget.getBoundingClientRect();
-                                  el.currentTime = ((e.clientX - rect.left) / rect.width) * duration;
-                                }}
-                              >
-                                <div style={{ ...styles.audioFill, width: `${duration ? (progress / duration) * 100 : 0}%` }} />
-                              </div>
-                              <div style={styles.audioTime}>
-                                {formatSeconds(progress)} / {formatSeconds(duration)}
-                              </div>
-                            </div>
-                          </div>
-                        )}
+                        {renderAudioPlayer({ id: item.id, src: audioSrc })}
 
                         {/* Transcript */}
                         {isExpanded && (
@@ -991,12 +1117,18 @@ const styles = {
   historyItemChevron: { color: "#94a3b8", fontSize: 12, fontWeight: 700 },
   historyItemMeta: { display: "flex", flexWrap: "wrap", gap: 10, color: "#94a3b8", fontSize: 12 },
   historyDeleteButton: { flexShrink: 0, border: "1px solid rgba(248,113,113,0.3)", borderRadius: 7, padding: "4px 8px", background: "transparent", color: "#f87171", fontSize: 12, cursor: "pointer", lineHeight: 1 },
-  audioPlayer: { display: "flex", alignItems: "center", gap: 8, marginTop: 8, padding: "6px 8px", borderRadius: 8, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" },
-  audioPlayButton: { flexShrink: 0, width: 30, height: 30, border: "1px solid rgba(167,139,250,0.5)", borderRadius: "50%", background: "rgba(109,40,217,0.25)", color: "#c4b5fd", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
-  audioTrackWrap: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 },
-  audioTrack: { height: 6, borderRadius: 999, background: "rgba(148,163,184,0.25)", cursor: "pointer", position: "relative", overflow: "hidden" },
-  audioFill: { height: "100%", borderRadius: 999, background: "linear-gradient(90deg, #a78bfa, #818cf8)", transition: "width 100ms linear" },
-  audioTime: { color: "#94a3b8", fontSize: 11, textAlign: "right" },
+  audioPlayer: { display: "flex", gap: 10, marginTop: 8, padding: "10px 12px", borderRadius: 10, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)" },
+  audioControls: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 8 },
+  audioControlsRow: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  audioPlayButton: { flexShrink: 0, minWidth: 56, height: 32, border: "1px solid rgba(167,139,250,0.5)", borderRadius: 8, background: "rgba(109,40,217,0.25)", color: "#c4b5fd", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+  audioTransportButton: { flexShrink: 0, minWidth: 52, height: 32, border: "1px solid rgba(148,163,184,0.3)", borderRadius: 8, background: "rgba(15,23,42,0.82)", color: "#cbd5e1", fontSize: 12, fontWeight: 700, cursor: "pointer" },
+  audioSliderRow: { display: "flex", alignItems: "center" },
+  audioSlider: { width: "100%", margin: 0, accentColor: "#8b5cf6", cursor: "pointer" },
+  audioTime: { marginLeft: "auto", color: "#94a3b8", fontSize: 11, textAlign: "right" },
+  audioVolumeRow: { display: "flex", alignItems: "center", gap: 8 },
+  audioVolumeLabel: { color: "#94a3b8", fontSize: 11, minWidth: 42 },
+  audioVolumeSlider: { flex: 1, margin: 0, accentColor: "#38bdf8", cursor: "pointer" },
+  audioVolumeValue: { color: "#cbd5e1", fontSize: 11, minWidth: 36, textAlign: "right" },
   historyTranscriptPanel: { marginTop: 10, paddingTop: 34, position: "relative" },
   historyTranscript: { color: "#f8fafc", whiteSpace: "pre-wrap", fontSize: 14, lineHeight: 1.5 },
   historyCopyButton: { position: "absolute", top: 0, right: 0, border: "1px solid rgba(148,163,184,0.3)", borderRadius: 8, padding: "6px 10px", background: "rgba(15,23,42,0.92)", color: "#cbd5e1", fontSize: 12, fontWeight: 700, cursor: "pointer" },

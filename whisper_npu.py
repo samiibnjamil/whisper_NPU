@@ -263,6 +263,9 @@ def main() -> None:
 
     core = Core()
     ensure_npu_available(core)
+    cache_dir = Path(__file__).parent / "data" / "npu_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    core.set_property("NPU", {"CACHE_DIR": str(cache_dir)})
 
     if not args.preload_only:
         if not args.audio:
